@@ -1,0 +1,26 @@
+name: convert-mods
+on: workflow_dispatch
+
+jobs:
+  convert:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with: { distribution: temurin, java-version: '17' }
+      - uses: android-actions/setup-android@v3
+        with:
+          packages: ''
+      - name: Android SDK pieces
+        run: sdkmanager "build-tools;35.0.0" "platforms;android-35"
+      - name: Convert the jars in mods-in/ to Bedrock mods
+        run: python3 mods-in/convert.py --install
+      - name: Build (API + every mod in java/mods)
+        run: bash scripts/build-java.sh
+      - uses: actions/upload-artifact@v4
+        with:
+          name: converted-mods
+          path: |
+            build/java/mods/*
+            mods-in/converted/**/REPORT.md
+            mods-in/converted/SUMMARY.txt
