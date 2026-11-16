@@ -201,7 +201,42 @@ MIXIN_RULES = [
     (r"net/minecraft/(world/item/BlockItem|item/BlockItem)$", r"^(place|useOnBlock)$", "block.place", "block place"),
     (r"net/minecraft/(client/Minecraft|client/MinecraftClient)$", r"^(tick|runTick|render)$", "game.update", "game tick/frame"),
     (r"net/minecraft/(client/multiplayer/ClientLevel|client/world/ClientWorld)$", r"^(tick)$", "level.tick", "client level tick"),
+    # wider coverage: the Bedrock moment that is closest to the Java injection point
+    (r"net/minecraft/(client/Camera|client/renderer/GameRenderer|client/renderer/LevelRenderer|client/render/Camera|client/render/GameRenderer|client/render/WorldRenderer)$",
+     r"^(setup|update|render|renderLevel|tick|getFov|bobView|pick|setRotation|setPosition|renderItemInHand)$", "game.update", "per-frame camera/render update"),
+    (r"net/minecraft/(server/level/ChunkMap|server/level/ServerChunkCache|server/world/ServerChunkManager)$", r"^(tick|tickChunk|tickChunks|tickSpawningChunk)$", "level.tick", "chunk/level tick"),
+    (r"net/minecraft/(world/item/Item|world/item/ItemStack|item/Item|item/ItemStack)$", r"^(use|useOn|finishUsingItem|releaseUsing|useOnBlock|finishUsing)$", "item.use", "item used"),
+    (r"net/minecraft/(world/entity/player/Player|entity/player/PlayerEntity)$", r"^(drop|dropItem)$", "item.drop", "item dropped"),
+    (r"net/minecraft/(world/inventory/ResultSlot|screen/slot/CraftingResultSlot)$", r"^(onTake|checkTakeAchievements|onTakeItem|onCrafted)$", "item.craft", "item crafted"),
+    (r"net/minecraft/(world/entity/Mob|world/entity/player/Player|world/entity/LivingEntity|entity/mob/MobEntity|entity/player/PlayerEntity)$", r"^(mobInteract|interact|interactOn|interactMob)$", "mob.interact", "entity interact"),
+    (r"net/minecraft/(server/level/ServerPlayer|server/network/ServerPlayerEntity|world/entity/player/Player|entity/player/PlayerEntity)$", r"^(die|onDeath)$", "player.die", "player death"),
+    (r"net/minecraft/(world/entity/Entity|entity/Entity)$", r"^(teleportTo|teleport|changeDimension|moveTo|requestTeleport)$", "player.teleport", "entity teleported"),
+    (r"net/minecraft/(world/level/block/Block|block/Block)$", r"^(playerDestroy|destroy|playerWillDestroy|onBreak|afterBreak|onDestroyedByPlayer)$", "block.break", "block broken"),
+    (r"net/minecraft/(world/level/block/Block|block/Block)$", r"^(setPlacedBy|onPlaced)$", "block.place", "block placed"),
 ]
+
+# Unmapped mixins: (category, regex on class + target names, closest Bedrock mechanism)
+MIXIN_TRIAGE = [
+    ("Entity models / animation", r"Model|EntityRenderer|AvatarRenderer|Skin|Pose|Humanoid|Animation|Armor.*Layer|RenderState|Layer",
+     "Bedrock client entity JSON in the resource pack (geometry, textures, animations, render controllers). Generated for entities the mod registers (see Entities); vanilla models need a resource-pack override, which has no runtime hook."),
+    ("Camera / rendering / atmosphere", r"Camera|Fov|Render|Shader|Sky|Cloud|Sunrise|Fog|Light|Glow|Particle|Vignette|Atmosphere|Mirror|Bob",
+     "Resource-pack data (fog, sky, particles, materials) and the options Bedrock.options() can write to options.txt (field of view, view distance, view bobbing). No per-frame renderer hook exists."),
+    ("Screens / GUI", r"Screen|Gui|Menu|Hud|Tooltip|Emi|Jei|Rei|Widget|Slot|Container|Overlay|Keybind|KeyMapping|Option",
+     "Text through Bedrock.hud() lines and toasts (already used for rewritten handlers). Bedrock form / UI JSON screens are separate resource-pack work."),
+    ("Entity AI / movement / vehicles", r"Goal|Brain|Mob|Animal|Villager|Boat|Minecart|Vehicle|Riding|Passenger|Movement|Physics|Navigation|Path|LivingEntity|Entity",
+     "Behaviour-pack entity components and behaviours (data-driven). Generated for entities the mod registers; vanilla entity changes would need a behaviour-pack override and are not generated."),
+    ("Blocks / block entities / items / recipes", r"Block|Furnace|Campfire|Fire|Fluid|Item|Inventory|Recipe|Crafting|Loot|Enchant|Hopper|Chest|Smelt",
+     "Behaviour-pack block/item JSON, recipes and loot tables. Identity, name, texture and a plain definition are generated; per-tick behaviour needs Bedrock block components or custom components."),
+    ("World / chunks / networking / other mods", r"Chunk|Level|World|Biome|Feature|Structure|Dimension|Packet|Network|Connection|Server|Sable|Ftb|Team|Command|Data|Persistent|Saved",
+     "Feature rules / dimension JSON for generation. Server networking and other mods' APIs (Sable, FTB, EMI ...) have no Bedrock counterpart."),
+]
+
+def triage_mixin(cname, targets):
+    key = cname.split("/")[-1] + " " + " ".join(targets)
+    for cat, rx, eq in MIXIN_TRIAGE:
+        if re.search(rx, key): return cat, eq
+    return "Other", "Not classifiable from its name; read the handler in the jar if it matters."
+
 # Known mods: id regex -> port template. These mods do work Bedrock can partly do through its options and HUD.
 KNOWN = [
     (r"^(lithium|sodium|embeddium|rubidium|starlight|ferritecore|modernfix|krypton|immediatelyfast|c2me.*|vmp.*|entityculling|moreculling|betterfps|sodium-extra|sodiumextra|reeses-sodium-options|iris|oculus)$", "perf",
@@ -417,6 +452,8 @@ ID_RX = re.compile(r"^[a-z][a-z0-9_]{1,40}$")
 def find_content(classes, meta_id):
     """[(kind, id)] for blocks / items / entities registered with Registry.register or DeferredRegister.register."""
     found = {}
+    sized_by_class, ent_by_class = {}, {}
+    find_content.sizes = {}
     for ci in classes.values():
         for m in ci.methods:
             reg, st = None, []
@@ -425,21 +462,106 @@ def find_content(classes, meta_id):
                     owner, name, desc = ci.member(struct.unpack(">H", arg)[0])
                     if REG_FIELD.match(name): reg = name.rstrip("S").lower().replace("_type", "")
                     st.append(("fld", name))
+                elif op in (0x0b, 0x0c, 0x0d):
+                    st.append(("f", float(op - 0x0b)))
                 elif op in (0x12, 0x13):
                     e = ci.cp[arg[0] if op == 0x12 else struct.unpack(">H", arg[:2])[0]]
-                    st.append(("str", ci.u(e[1])) if e and e[0] == 8 else ("c",))
+                    st.append(("str", ci.u(e[1])) if e and e[0] == 8 else (("f", float(e[1])) if e and e[0] == 4 else ("c",)))
                 elif op in (0xb6, 0xb7, 0xb8, 0xb9):
                     owner, name, desc = ci.member(struct.unpack(">H", arg[:2])[0])
                     n = _arg_count(desc); args = st[-n:] if n else []; st = st[:-n] if n else st
+                    if name == "sized" and n == 2 and all(a[0] == "f" for a in args):
+                        sized_by_class.setdefault(ci.name, []).append((args[0][1], args[1][1]))
                     if name in REG_CALL and reg:
                         for a in args:
                             if a[0] == "str" and ID_RX.match(a[1]):
                                 found[(reg, a[1])] = 1
+                                if reg == "entity": ent_by_class.setdefault(ci.name, []).append(a[1])
                     if not _ret_void(desc): st.append(("r",))
                 else:
                     if len(st) > 8: st = st[-8:]
+    for cn, ids in ent_by_class.items():           # registrations and .sized(w, h) calls appear in the same order
+        sz = sized_by_class.get(cn, [])
+        if sz and len(sz) == len(ids):
+            for i, wh in zip(ids, sz): find_content.sizes[i] = wh
     return sorted((k, i) for (k, i) in found)
 
+
+
+def _make_tex_resolver(z, names, ns):
+    """Resolve a block/item texture through blockstates -> models -> parent chain, then by name patterns."""
+    nameset = set(names)
+    cache = {}
+    def jload(path):
+        if path not in cache:
+            try: cache[path] = json.loads(z.read(path).decode("utf-8", "replace")) if path in nameset else None
+            except Exception: cache[path] = None
+        return cache[path]
+    def model_path(ref, default_ns):
+        m, _, p = ref.rpartition(":")
+        return f"assets/{m or default_ns}/models/{p}.json"
+    def tex_path(ref, default_ns):
+        m, _, p = ref.rpartition(":")
+        return f"assets/{m or default_ns}/textures/{p}.png"
+    PREF = ("all", "layer0", "particle", "end", "top", "side", "front", "north", "texture", "cross", "0")
+    def from_model(ref, default_ns, depth=0):
+        if depth > 6 or not ref: return None
+        mp = model_path(ref, default_ns); md = jload(mp)
+        if not md: return None
+        tx = dict(md.get("textures") or {})
+        par = md.get("parent")
+        if par and not par.startswith("minecraft:") and not par.startswith("builtin"):
+            # merge parent textures (child wins)
+            pt = _collect(par, default_ns, depth + 1)
+            for k, v in pt.items(): tx.setdefault(k, v)
+        def deref(v, hop=0):
+            while isinstance(v, str) and v.startswith("#") and hop < 8: v = tx.get(v[1:]); hop += 1
+            return v
+        for k in PREF:
+            v = deref(tx.get(k))
+            if isinstance(v, str) and tex_path(v, default_ns) in nameset: return tex_path(v, default_ns)
+        for v in tx.values():
+            v = deref(v)
+            if isinstance(v, str) and tex_path(v, default_ns) in nameset: return tex_path(v, default_ns)
+        return None
+    def _collect(ref, default_ns, depth):
+        md = jload(model_path(ref, default_ns)) or {}
+        tx = dict(md.get("textures") or {})
+        par = md.get("parent")
+        if par and depth < 6 and not par.startswith("minecraft:") and not par.startswith("builtin"):
+            for k, v in _collect(par, default_ns, depth + 1).items(): tx.setdefault(k, v)
+        return tx
+    def by_name(kind, i):
+        cands = [f"assets/{ns}/textures/{kind}/{i}.png"] + [f"assets/{ns}/textures/{kind}/{i}{suf}.png" for suf in ("_top", "_side", "_front", "_0", "_off", "_on", "_active", "_base")]
+        for c in cands:
+            if c in nameset: return c
+        rx = re.compile(r"assets/[^/]+/textures/%s/%s(_[^/]*)?\.png$" % (kind, re.escape(i)))
+        return next((n for n in sorted(names) if rx.match(n)), None)
+    def block(b):
+        for nsx in {ns} | {n.split("/")[1] for n in names if n.startswith("assets/") and n.count("/") > 1}:
+            bs = jload(f"assets/{nsx}/blockstates/{b}.json")
+            if not bs: continue
+            refs = []
+            if "variants" in bs:
+                v = bs["variants"]; v = list(v.values())[0] if isinstance(v, dict) and v else None
+                v = v[0] if isinstance(v, list) and v else v
+                if isinstance(v, dict) and v.get("model"): refs.append(v["model"])
+            for part in bs.get("multipart", []) or []:
+                a = part.get("apply"); a = a[0] if isinstance(a, list) and a else a
+                if isinstance(a, dict) and a.get("model"): refs.append(a["model"])
+            for r in refs:
+                t = from_model(r, nsx)
+                if t: return t
+        t = from_model(f"{ns}:block/{b}", ns)
+        return t or by_name("block", b)
+    def item(i):
+        t = from_model(f"{ns}:item/{i}", ns)
+        return t or by_name("item", i) or block(i)
+    def evidence(kind, i, lang):
+        k = "block" if kind == "block" else "item"
+        return (f"{k}.{ns}.{i}" in lang or f"assets/{ns}/blockstates/{i}.json" in nameset or f"assets/{ns}/models/{k}/{i}.json" in nameset
+                or f"assets/{ns}/textures/{k}/{i}.png" in nameset or f"assets/{ns}/items/{i}.json" in nameset)
+    return block, item, evidence
 
 def build_addon(z, meta, content, out):
     """Write <out>/addon/<id>_BP and <id>_RP for the blocks and items found. Returns (items, blocks, skipped, notes)."""
@@ -453,6 +575,15 @@ def build_addon(z, meta, content, out):
             except Exception: pass
     items = [i for k, i in content if k == "item"]; blocks = [i for k, i in content if k == "block"]
     entities = [i for k, i in content if k == "entity"]
+    if not (items or blocks): return [], [], entities, []
+    tex_block, tex_item, has_evidence = _make_tex_resolver(z, names, ns)
+    has_assets = any(re.match(r"assets/[^/]+/(blockstates|models|lang)/", n) for n in names)
+    dropped = []
+    if has_assets:   # strings such as "east", "north" or the mod id are property/enum names, not registry entries
+        keep_b = [b for b in blocks if b != ns and has_evidence("block", b, lang)]
+        keep_i = [i for i in items if i != ns and (has_evidence("item", i, lang) or i in keep_b)]
+        dropped = sorted((set(blocks) - set(keep_b)) | (set(items) - set(keep_i)))
+        blocks, items = keep_b, keep_i
     if not (items or blocks): return [], [], entities, []
     bp, rp = out / "addon" / (ns + "_BP"), out / "addon" / (ns + "_RP")
     for d in ("items", "blocks"): (bp / d).mkdir(parents=True, exist_ok=True)
@@ -468,7 +599,7 @@ def build_addon(z, meta, content, out):
     lines, item_tex, terrain, notes = [], {}, {}, []
     def title(i): return i.replace("_", " ").title()
     for i in items:
-        tex = next((n for n in names if re.match(r"assets/[^/]+/textures/item/%s\.png$" % re.escape(i), n)), None)
+        tex = tex_item(i)
         comp = {"minecraft:max_stack_size": 64}
         if tex:
             (rp / "textures/items" / (i + ".png")).write_bytes(z.read(tex)); item_tex[f"{ns}_{i}"] = {"textures": f"textures/items/{i}"}
@@ -477,7 +608,7 @@ def build_addon(z, meta, content, out):
             "description": {"identifier": f"{ns}:{i}", "menu_category": {"category": "items"}}, "components": comp}}, indent=2))
         lines.append(f"item.{ns}:{i}={lang.get(f'item.{ns}.{i}', title(i))}")
     for b in blocks:
-        tex = next((n for n in names if re.match(r"assets/[^/]+/textures/block/%s\.png$" % re.escape(b), n)), None)
+        tex = tex_block(b)
         inst = {"*": {"texture": f"{ns}_{b}", "render_method": "opaque"}}
         if tex:
             (rp / "textures/blocks" / (b + ".png")).write_bytes(z.read(tex)); terrain[f"{ns}_{b}"] = {"textures": f"textures/blocks/{b}"}
@@ -486,10 +617,131 @@ def build_addon(z, meta, content, out):
             "description": {"identifier": f"{ns}:{b}", "menu_category": {"category": "construction"}},
             "components": {"minecraft:material_instances": inst, "minecraft:geometry": "minecraft:geometry.full_block"}}}, indent=2))
         lines.append(f"tile.{ns}:{b}.name={lang.get(f'block.{ns}.{b}', title(b))}")
+    if dropped: notes.append(f"{len(dropped)} name(s) skipped because they have no model, blockstate, texture or language entry in the jar (property/enum strings, not registry entries): " + ", ".join(f"`{d}`" for d in dropped[:12]) + (" ..." if len(dropped) > 12 else ""))
     if item_tex: (rp / "textures/item_texture.json").write_text(json.dumps({"resource_pack_name": ns, "texture_name": "atlas.items", "texture_data": item_tex}, indent=2))
     if terrain: (rp / "textures/terrain_texture.json").write_text(json.dumps({"resource_pack_name": ns, "texture_name": "atlas.terrain", "padding": 8, "num_mip_levels": 4, "texture_data": terrain}, indent=2))
     (rp / "texts/en_US.lang").write_text("\n".join(lines) + "\n")
     return items, blocks, entities, notes
+
+
+ENTITY_ARCH = [
+    ("seat", r"seat|chair|cockpit|saddle|pilot"),
+    ("projectile", r"grenade|bolt|shot|projectile|missile|bullet|arrow|laser|plasma|bomb|dart|fireball|beam|orb"),
+    ("vehicle", r"rocket|ship|shuttle|craft|lander|vehicle|car|cart|boat|rover|hover|bike|train|mech|plane|jet|drone|cargo|capsule|pod"),
+]
+FLYERS = r"rocket|ship|shuttle|lander|plane|jet|drone|hover|capsule|pod|craft"
+
+
+def _png(w, h, rgb):
+    import zlib
+    raw = b"".join(b"\x00" + bytes(rgb) * w for _ in range(h))
+    def ch(t, d): return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d) & 0xffffffff)
+    return b"\x89PNG\r\n\x1a\n" + ch(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) + ch(b"IDAT", zlib.compress(raw)) + ch(b"IEND", b"")
+
+
+def entity_components(arch, i, w, h):
+    base = {"minecraft:type_family": {"family": [i]}, "minecraft:collision_box": {"width": w, "height": h}, "minecraft:physics": {}, "minecraft:nameable": {}}
+    if arch == "seat":
+        base.update({"minecraft:health": {"value": 1, "max": 1}, "minecraft:damage_sensor": {"triggers": {"deals_damage": "no"}},
+                     "minecraft:knockback_resistance": {"value": 1.0}, "minecraft:pushable": {"is_pushable": False, "is_pushable_by_piston": False},
+                     "minecraft:rideable": {"seat_count": 1, "family_types": ["player"], "interact_text": "action.interact.ride.horse",
+                                            "seats": {"position": [0, round(h * 0.5, 2), 0]}}})
+    elif arch == "projectile":
+        base.update({"minecraft:health": {"value": 1, "max": 1}, "minecraft:pushable": {"is_pushable": False, "is_pushable_by_piston": True},
+                     "minecraft:projectile": {"on_hit": {"impact_damage": {"damage": 4, "knockback": True, "semi_random_diff_damage": False}, "remove_on_hit": {}},
+                                              "power": 1.6, "gravity": 0.03, "inertia": 0.99, "liquid_inertia": 0.6, "uncertainty_base": 1,
+                                              "uncertainty_multiplier": 0, "anchor": 1, "offset": [0, -0.1, 0]}})
+    elif arch == "vehicle":
+        base.update({"minecraft:health": {"value": 40, "max": 40}, "minecraft:movement": {"value": 0.3}, "minecraft:movement.basic": {}, "minecraft:jump.static": {},
+                     "minecraft:rideable": {"seat_count": 1, "family_types": ["player"], "interact_text": "action.interact.ride.horse",
+                                            "seats": {"position": [0, round(h * 0.5, 2), 0]}}})
+        if re.search(FLYERS, i):
+            base.update({"minecraft:can_fly": {}, "minecraft:flying_speed": {"value": 0.5}, "minecraft:movement.fly": {}, "minecraft:input_air_controlled": {}})
+        else:
+            base.update({"minecraft:input_ground_controlled": {}})
+    else:
+        base.update({"minecraft:health": {"value": 20, "max": 20}, "minecraft:movement": {"value": 0.25}, "minecraft:movement.basic": {}, "minecraft:jump.static": {},
+                     "minecraft:navigation.walk": {"can_path_over_water": True, "avoid_water": True}, "minecraft:behavior.float": {"priority": 0},
+                     "minecraft:behavior.random_stroll": {"priority": 6}, "minecraft:behavior.look_at_player": {"priority": 7, "look_distance": 6},
+                     "minecraft:behavior.random_look_around": {"priority": 9}})
+    return base
+
+
+def build_entities(z, meta, entities, out):
+    """Bedrock entity (behaviour + client definition + geometry + texture) for each registered entity. Returns (generated, notes)."""
+    import uuid, hashlib
+    ns = meta["id"]; names = z.namelist(); nameset = set(names)
+    if not entities: return [], []
+    lang = {}
+    for n in names:
+        if re.match(r"assets/[^/]+/lang/en_us\.json$", n):
+            try: lang.update(json.loads(z.read(n).decode("utf-8", "replace")))
+            except Exception: pass
+    sizes = getattr(find_content, "sizes", {})
+    def tex_for(i):
+        rx = re.compile(r"assets/[^/]+/textures/entity/(?:[^/]+/)*%s(?:_[^/]*)?\.png$" % re.escape(i))
+        return next((n for n in sorted(names) if rx.match(n)), None)
+    def geo_for(i):
+        rx = re.compile(r"assets/[^/]+/(?:geo|models/entity|geo/entity)/(?:[^/]+/)*%s(?:\.geo)?\.json$" % re.escape(i))
+        for n in sorted(names):
+            if rx.match(n):
+                try:
+                    j = json.loads(z.read(n).decode("utf-8", "replace"))
+                    if "minecraft:geometry" in j or any(k.startswith("geometry.") for k in j): return j
+                except Exception: pass
+        return None
+    gen, notes, skipped = [], [], []
+    bp, rp = out / "addon" / (ns + "_BP"), out / "addon" / (ns + "_RP")
+    def manifest(kind, mod_type):
+        return {"format_version": 2, "header": {"name": meta["name"] + (" Behavior" if kind == "bp" else " Resources"), "description": "Converted by ModHost mods-in/convert.py",
+                "uuid": str(uuid.uuid5(uuid.NAMESPACE_DNS, ns + kind + ("rph" if kind == "rp" else "h"))), "version": [1, 0, 0], "min_engine_version": [1, 21, 0]},
+                "modules": [{"type": mod_type, "uuid": str(uuid.uuid5(uuid.NAMESPACE_DNS, ns + kind + "m")), "version": [1, 0, 0]}],
+                "dependencies": ([{"uuid": str(uuid.uuid5(uuid.NAMESPACE_DNS, ns + "rph")), "version": [1, 0, 0]}] if kind == "bp" else [])}
+    for d in (bp / "entities", rp / "entity", rp / "models/entity", rp / "textures/entity", rp / "texts"): d.mkdir(parents=True, exist_ok=True)
+    for pk, kind, mt in ((bp, "bp", "data"), (rp, "rp", "resources")):
+        if not (pk / "manifest.json").exists(): (pk / "manifest.json").write_text(json.dumps(manifest(kind, mt), indent=2))
+    lines = []
+    for i in entities:
+        arch = next((a for a, rx in ENTITY_ARCH if re.search(rx, i)), "mob")
+        geo, tex = geo_for(i), tex_for(i)
+        evidence = geo or tex or f"entity.{ns}.{i}" in lang or arch != "mob"
+        if not evidence or (i == ns and not (geo or tex)): skipped.append(i); continue
+        dw, dh = {"seat": (0.8, 0.8), "projectile": (0.4, 0.4), "vehicle": (1.8, 2.0), "mob": (0.6, 1.8)}[arch]
+        w, h = sizes.get(i, (dw, dh)); w = min(max(w, 0.1), 16); h = min(max(h, 0.1), 16)
+        gid = f"geometry.{ns}_{i}"
+        if geo:
+            if "minecraft:geometry" in geo:
+                geo["minecraft:geometry"][0].setdefault("description", {})["identifier"] = gid
+            else:
+                k = next(k for k in geo if k.startswith("geometry.")); geo[gid] = geo.pop(k)
+            gkind = "model from the jar"
+        else:
+            geo = {"format_version": "1.12.0", "minecraft:geometry": [{"description": {"identifier": gid, "texture_width": 64, "texture_height": 64,
+                   "visible_bounds_width": max(2, round(w * 2)), "visible_bounds_height": max(2, round(h * 2)), "visible_bounds_offset": [0, round(h / 2, 2), 0]},
+                   "bones": [{"name": "body", "pivot": [0, 0, 0], "cubes": [{"origin": [round(-w * 8, 2), 0, round(-w * 8, 2)], "size": [round(w * 16, 2), round(h * 16, 2), round(w * 16, 2)], "uv": [0, 0]}]}]}]}
+            gkind = "placeholder box"
+        (rp / "models/entity" / (i + ".geo.json")).write_text(json.dumps(geo, indent=2))
+        if tex: (rp / "textures/entity" / (i + ".png")).write_bytes(z.read(tex)); tkind = "texture from the jar"
+        else:
+            hx = hashlib.md5(i.encode()).digest(); (rp / "textures/entity" / (i + ".png")).write_bytes(_png(64, 64, (80 + hx[0] // 2, 80 + hx[1] // 2, 80 + hx[2] // 2))); tkind = "placeholder colour"
+        (bp / "entities" / (i + ".json")).write_text(json.dumps({"format_version": "1.21.0", "minecraft:entity": {
+            "description": {"identifier": f"{ns}:{i}", "is_spawnable": True, "is_summonable": True, "is_experimental": False},
+            "components": entity_components(arch, i, round(w, 2), round(h, 2))}}, indent=2))
+        hx = hashlib.md5((i + "egg").encode()).digest()
+        (rp / "entity" / (i + ".entity.json")).write_text(json.dumps({"format_version": "1.10.0", "minecraft:client_entity": {"description": {
+            "identifier": f"{ns}:{i}", "materials": {"default": "entity_alphatest"}, "textures": {"default": f"textures/entity/{i}"}, "geometry": {"default": gid},
+            "render_controllers": ["controller.render.default"], "spawn_egg": {"base_color": "#%02x%02x%02x" % tuple(hx[:3]), "overlay_color": "#%02x%02x%02x" % tuple(hx[3:6])}}}}, indent=2))
+        nm = lang.get(f"entity.{ns}.{i}", i.replace("_", " ").title())
+        lines += [f"entity.{ns}:{i}.name={nm}", f"item.spawn_egg.entity.{ns}:{i}.name={nm} Spawn Egg"]
+        gen.append((i, arch, gkind, tkind, (w, h) if i in sizes else None))
+    lf = rp / "texts/en_US.lang"
+    old = lf.read_text() if lf.exists() else ""
+    lf.write_text(old + ("\n" if old and not old.endswith("\n") else "") + "\n".join(lines) + ("\n" if lines else ""))
+    if skipped: notes.append("registered names with no model, texture, language entry or recognisable role (probably property strings): " + ", ".join(f"`{x}`" for x in skipped))
+    for i, arch, gk, tk, sz in gen:
+        if gk == "placeholder box" or tk == "placeholder colour":
+            notes.append(f"entity `{i}` ({arch}): {gk}, {tk}; replace models/entity/{i}.geo.json and textures/entity/{i}.png with real art")
+    return gen, notes
 
 
 # ----------------------------------------------------------------------------------------------------------------
@@ -712,12 +964,14 @@ def convert(jar, install):
             "id": mid, "name": name, "version": meta["version"] or "converted", "author": meta["author"] or "converted by ModHost",
             "bedrock": pkg + "." + cls}, indent=2) + "\n")
     items, blocks, entities, addon_notes = build_addon(z, meta, content, out)
+    ent_gen, ent_notes = build_entities(z, meta, entities, out)
+    addon_notes = addon_notes + ent_notes
 
     # ---- report
     R = [f"# {name}  ->  Bedrock", "",
          f"* source: `{pathlib.Path(jar).name}`  ({meta['loader']}, id `{mid}`, version `{meta['version']}`, {nclasses} classes)",
          f"* mod: **{mode}**" + (f"  -> `java/mods/{mid}/`" if code else "  (no mod generated)"),
-         f"* add-on: **{len(items)} item(s), {len(blocks)} block(s)**  -> `mods-in/converted/{mid}/addon/` (zip both folders as a .mcaddon)" if (items or blocks) else "* add-on: none", ""]
+         f"* add-on: **{len(items)} item(s), {len(blocks)} block(s), {len(ent_gen)} entity(ies)**  -> `mods-in/converted/{mid}/addon/` (also zipped as `{mid}.mcaddon`)" if (items or blocks or ent_gen) else "* add-on: none", ""]
     if port: R += ["## Known mod", port[1], ""]
     if events:
         R += ["## Events", "| Java source | Bedrock event | status | rewritten actions |", "|---|---|---|---|"]
@@ -730,20 +984,33 @@ def convert(jar, install):
     if handlers:
         R += ["## Handlers read from bytecode"]
         for ev, hs in sorted(handlers.items()):
+            seen_h = set()
             for h in hs:
+                if (h.cname, h.mname, h.why) in seen_h: continue
+                seen_h.add((h.cname, h.mname, h.why))
                 R.append(f"* `{ev}` <- `{h.cname.split('/')[-1]}.{h.mname}` ({h.why})")
                 for kind, parts in h.actions: R.append(f"  * rewritten: {kind} {tmpl_expr(parts)}")
                 if h.untranslated:
                     top = sorted(h.untranslated.items(), key=lambda kv: -kv[1])[:10]
                     R.append("  * not rewritten (Java Edition calls with no Bedrock equivalent): " + ", ".join(f"`{k}`" for k, _ in top))
         R.append("")
+    mixin_hits = list(dict.fromkeys(mixin_hits))
     if mixin_hits:
         R += ["## Mixins mapped"] + [f"* `{c.split('/')[-1]}` into `{t.split('/')[-1]}` -> `{ev}` ({why})" for c, t, ev, why in mixin_hits] + [""]
     R += ["## NOT converted"]
     if unmapped:
-        R.append(f"* {len(unmapped)} Mixin class(es) patch Java Edition code Bedrock does not expose (rendering, AI, world generation, packets): " +
-                 ", ".join(f"`{c.split('/')[-1]}`" for c, _ in unmapped[:12]) + (" ..." if len(unmapped) > 12 else ""))
-    if entities: R.append("* Entities registered (" + ", ".join(entities[:8]) + "): need models, animations and AI in Bedrock JSON; not generated.")
+        groups = {}
+        for c, tg in unmapped:
+            cat, eq = triage_mixin(c, tg); groups.setdefault((cat, eq), []).append(c.split("/")[-1])
+        R.append(f"* {len(unmapped)} Mixin class(es) have no native hook. Closest Bedrock mechanism for each group (none of these can run Java Edition code):")
+        for (cat, eq), cl in sorted(groups.items()):
+            R.append(f"  * **{cat}** ({len(cl)}): " + ", ".join(f"`{x}`" for x in cl))
+            R.append(f"    * Bedrock equivalent: {eq}")
+        (out / "mixins.json").write_text(json.dumps([{"mixin": c.split("/")[-1], "targets": tg, "category": triage_mixin(c, tg)[0]} for c, tg in unmapped], indent=2))
+    if ent_gen:
+        R.append("* Entities generated as Bedrock JSON (behaviour + client definition + geometry + texture + spawn egg): " + ", ".join(f"`{i}` ({a})" for i, a, *_ in ent_gen) +
+                 ". Behaviour is a template for the entity's role (seat / vehicle / projectile / mob) chosen from its name; the Java AI, custom controls and animations are not converted.")
+    elif entities: R.append("* Entities registered (" + ", ".join(entities[:8]) + "): no model, texture or role could be recognised, so none were generated.")
     if items or blocks: R.append("* Items/blocks have identity, name, texture and a plain full-block / stack-of-64 definition only. Their Java behaviour (use, break, tick, recipes, loot, world gen) is not converted.")
     for n in addon_notes: R.append("* " + n)
     for e in events:
@@ -754,7 +1021,7 @@ def convert(jar, install):
     if mode == "nothing to convert": R.append("* No game event, known-mod behaviour or hookable Mixin was found, so no Bedrock mod was generated.")
     (out / "REPORT.md").write_text("\n".join(R) + "\n")
 
-    if items or blocks:   # a ready-to-import pack
+    if items or blocks or ent_gen:   # a ready-to-import pack
         import zipfile as zf
         with zf.ZipFile(out / (mid + ".mcaddon"), "w", zf.ZIP_DEFLATED) as mc:
             for f in (out / "addon").rglob("*"):
