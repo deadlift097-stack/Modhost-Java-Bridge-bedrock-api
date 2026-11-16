@@ -39,6 +39,14 @@ pattern in `<dataDir>/signatures/player.attack.txt` (found in a disassembler, sa
 installs on next start; converted mods that listen to attacks are generated against it. `mob.kill` and `player.die` fire today.
 `tools/binxref.py` has the helpers used (vtable_of, refs_to, fn_strings).
 
+## player.attack: second attempt (this libminecraftpe.so, 342 MB)
+Re-ran `tools/find_hooks.py` on this exact library: all 17 patterns are found, unique, and identical to `Signatures.inc`.
+Searched again for the attack function: the script-API names (`PlayerItemAttackEntityBeforeEvent`, `EntityHitEntityAfterEvent`,
+`EntityHitEventSignal`, `playerItemAttackEntity`) only resolve to script-module registration code (run once at startup, not on a hit).
+No readable function name or telemetry event exists for the attack. A pattern was NOT guessed: a detour on the wrong function crashes the game.
+To finish it, find `Player::attack(Actor&, ActorDamageCause const&)` in a disassembler (it is a virtual in the Player vtable, next to
+`tickWorld`, which `tools/binxref.py vtable_of` can list) and save its pattern as `signatures/player.attack.txt`.
+
 ## Notes
 * **Single-player join:** `world.join` uses `_joinWorldInProgressSubclient`, whose name suggests it may not run for an ordinary
   local join. If `hook.first` never prints `world.join`, use `player.tick` (first tick) or `block.*` events as the signal.
